@@ -1,0 +1,29 @@
+{
+  "manifest_version": "0.2",
+  "name": "windbg-mcp",
+  "version": "1.0.0",
+  "description": "WinDbg MCP — full Windows debugger control via MCP tools",
+  "author": {
+    "name": "Gengstah"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "windbg_mcp.py",
+    "mcp_config": {
+      "command": "python",
+      "args": [
+        "${__dirname}/windbg_mcp.py"
+      ],
+      "env": {
+        "PYTHONPATH": "${__dirname}/server/lib"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "WinDbg"
+    }
+  ],
+  "tools_generated": true,
+  "license": "MIT"
+}
