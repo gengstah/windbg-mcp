@@ -29,6 +29,8 @@ AVAILABLE TOOLS (47 total):
     Utility:    raw
 """
 
+import io
+import itertools
 import sys
 import threading
 from datetime import datetime
@@ -53,9 +55,25 @@ except ImportError:
 # ---------------------------------------------------------------------------
 try:
     from pybag import UserDbg, KernelDbg, CrashDbg, DbgEng
+    from pybag.dbgeng import util as _pybag_util
+    from pybag.dbgeng import exception as _pybag_exc
+    from pybag.dbgeng.idebugclient import DebugClient as _DebugClient
     PYBAG_AVAILABLE = True
+
+    # pybag ships with `OpenDumpFile` and `OpenDumpFileWide` left as
+    # E_NOTIMPL stubs, which makes CrashDbg.load_dump() unusable upstream.
+    # The underlying COM IDebugClient.OpenDumpFile entry point is fine, so
+    # patch the wrapper to dispatch to it.
+    def _open_dump_file(self, dump_file):
+        if isinstance(dump_file, str):
+            dump_file = dump_file.encode()
+        hr = self._cli.OpenDumpFile(dump_file)
+        _pybag_exc.check_err(hr)
+
+    _DebugClient.OpenDumpFile = _open_dump_file
 except ImportError:
     PYBAG_AVAILABLE = False
+    _pybag_util = None
     print(
         "WARNING: pybag not available.\n"
         "  1. Install: pip install pybag\n"
@@ -90,7 +108,6 @@ class DebuggerState:
         self.dbg_type = None     # 'user' | 'kernel' | 'crash'
         self.captures: list[dict] = []
         self.bp_map: dict[int, dict] = {}
-        self._bp_counter = 0
         self.lock = threading.Lock()
 
     def reset(self):
@@ -100,11 +117,6 @@ class DebuggerState:
             except Exception:
                 pass
         self.__init__()
-
-    def next_bp_id(self) -> int:
-        bp_id = self._bp_counter
-        self._bp_counter += 1
-        return bp_id
 
     def make_handler(self, bp_info: dict):
         """
@@ -131,22 +143,17 @@ class DebuggerState:
 
             # Registers
             try:
-                reg_dict = {}
-                for name in dbg.regs:
-                    try:
-                        reg_dict[name] = hex(dbg.regs[name])
-                    except Exception:
-                        pass
-                capture["registers"] = reg_dict
+                capture["registers"] = _gather_registers(dbg.reg)
             except Exception as e:
                 capture["registers"] = {"error": str(e)}
 
             # PC / instruction / nearest symbol
             try:
-                pc = dbg.pc()
+                pc = dbg.reg.get_pc()
                 capture["rip"] = hex(pc)
                 capture["symbol_at_rip"] = dbg.get_name_by_offset(pc)
-                capture["instruction"] = dbg.instruction_at(pc)
+                ins = dbg.instruction_at(pc)
+                capture["instruction"] = ins[0] if ins else None
             except Exception as e:
                 capture["rip_error"] = str(e)
 
@@ -166,7 +173,7 @@ class DebuggerState:
 
             # Memory at RSP (64 bytes of stack context)
             try:
-                sp = dbg.regs.get_sp()
+                sp = dbg.reg.get_sp()
                 data = dbg.read(sp, 64)
                 capture["context_memory"]["stack_at_rsp"] = {
                     "addr": hex(sp),
@@ -179,7 +186,7 @@ class DebuggerState:
 
             # Memory at RIP (32 bytes of code context)
             try:
-                pc = dbg.pc()
+                pc = dbg.reg.get_pc()
                 data = dbg.read(pc, 32)
                 capture["context_memory"]["code_at_rip"] = {
                     "addr": hex(pc),
@@ -233,6 +240,79 @@ def _fmt_bytes(data: bytes) -> dict:
     }
 
 
+# Common x64/x86 register names — used as a fallback when reg iteration fails.
+# In kernel mode at the initial break, GetNumberRegisters() can return 0 even
+# though individual registers are accessible by name via GetIndexByName.
+_COMMON_REGS = (
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "rip",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+    "efl", "eflags", "cs", "ds", "es", "fs", "gs", "ss",
+    "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip",
+    "fs_base", "gs_base", "kmxcsr", "mxcsr",
+    "cr0", "cr2", "cr3", "cr4", "cr8",
+    "dr0", "dr1", "dr2", "dr3", "dr6", "dr7",
+)
+
+
+def _gather_registers(reg) -> dict:
+    """Return all readable registers as {name: hex_value}.
+
+    pybag's Registers iteration yields (name, value) tuples and depends on
+    GetNumberRegisters() — which returns 0 in kernel mode at certain stops.
+    Fall back to a common register-name list so the user always gets *something*.
+    """
+    result: dict[str, str] = {}
+    try:
+        for item in reg.register_list():
+            try:
+                name, val = item
+                if isinstance(name, bytes):
+                    name = name.decode(errors="ignore")
+                result[str(name)] = hex(val)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if result:
+        return result
+    for n in _COMMON_REGS:
+        try:
+            result[n] = hex(reg[n])
+        except Exception:
+            continue
+    return result
+
+
+def _decode(s) -> str:
+    if isinstance(s, bytes):
+        try:
+            return s.decode("utf-8", errors="replace")
+        except Exception:
+            return s.decode("latin-1", errors="replace")
+    return s
+
+
+def _silence_dbgeng_output(dbg) -> None:
+    """Route dbgeng's banner / module-load / symbol-path output away from sys.stdout.
+
+    pybag wires DbgEngCallbacks to sys.stdout by default, which means every
+    "Loaded symbols for ..." or extension-gallery banner line gets written to
+    stdout. In an MCP stdio server, stdout is the JSON-RPC channel — those
+    lines corrupt the protocol and disconnect the client. Redirect to stderr
+    instead. Both `stdout` and the cached `_stdout_orig` must be replaced so
+    that pybag's `cmd()` (which calls `reset_stdout()`) doesn't restore the
+    sys.stdout binding after each command.
+    """
+    cb = getattr(dbg, "callbacks", None)
+    if cb is None:
+        return
+    try:
+        cb._stdout_orig = sys.stderr
+        cb.stdout = sys.stderr
+    except Exception:
+        pass
+
+
 # ===========================================================================
 #  MCP TOOLS — Session management
 # ===========================================================================
@@ -264,9 +344,15 @@ def list_processes() -> list:
     Returns: [{pid, name, description}]
     """
     tmp = UserDbg()
-    procs = tmp.proc_list()
-    tmp.Release()
-    return [{"pid": p[0], "name": p[1], "description": p[2]} for p in procs]
+    _silence_dbgeng_output(tmp)
+    try:
+        procs = tmp.proc_list()
+    finally:
+        tmp.Release()
+    return [
+        {"pid": p[0], "name": _decode(p[1]), "description": _decode(p[2])}
+        for p in procs
+    ]
 
 
 @mcp.tool()
@@ -285,6 +371,7 @@ def create(path: str, args: str = "", initial_break: bool = True) -> dict:
         raise ValueError("path is required")
     STATE.reset()
     dbg = UserDbg()
+    _silence_dbgeng_output(dbg)
     cmd_line = f'"{path}" {args}' if args else f'"{path}"'
     dbg.create(cmd_line, initial_break=initial_break)
     STATE.dbg = dbg
@@ -306,6 +393,7 @@ def attach(pid: int = None, name: str = None, initial_break: bool = True) -> dic
     """
     STATE.reset()
     dbg = UserDbg()
+    _silence_dbgeng_output(dbg)
     if name and not pid:
         pids = UserDbg.pids_by_name(name)
         if not pids:
@@ -334,6 +422,7 @@ def kernel_attach(connect_string: str, initial_break: bool = False) -> dict:
         raise ValueError("connect_string is required, e.g. 'net:port=55000,key=1.2.3.4'")
     STATE.reset()
     k = KernelDbg()
+    _silence_dbgeng_output(k)
     k.attach(connect_string, initial_break=initial_break)
     STATE.dbg = k
     STATE.dbg_type = "kernel"
@@ -354,10 +443,11 @@ def load_dump(path: str) -> dict:
         raise ValueError("path is required")
     STATE.reset()
     c = CrashDbg()
+    _silence_dbgeng_output(c)
     c.load_dump(path)
     STATE.dbg = c
     STATE.dbg_type = "crash"
-    pc = c.pc()
+    pc = c.reg.get_pc()
     return {
         "status": "loaded",
         "bitness": c.bitness(),
@@ -381,6 +471,7 @@ def connect(options: str) -> dict:
     if STATE.dbg is None:
         STATE.reset()
         STATE.dbg = UserDbg()
+        _silence_dbgeng_output(STATE.dbg)
         STATE.dbg_type = "user"
     STATE.dbg.connect(options)
     return {"status": "connected", "options": options}
@@ -389,28 +480,50 @@ def connect(options: str) -> dict:
 @mcp.tool()
 def detach() -> dict:
     """
-    Detach from the current process (process keeps running).
+    End the current debugging session.
+
+    User mode: detaches (process keeps running).
+    Kernel mode: ends the active debug session (target keeps running).
+    Crash dump: closes the dump.
 
     Returns: {status}
     """
     if STATE.dbg is None:
         return {"status": "no_session"}
-    STATE.dbg.detach()
-    STATE.dbg = None
+    try:
+        if STATE.dbg_type == "crash":
+            try:
+                STATE.dbg._client.EndSession(DbgEng.DEBUG_END_PASSIVE)
+            except Exception:
+                pass
+        elif hasattr(STATE.dbg, "detach"):
+            STATE.dbg.detach()
+    finally:
+        STATE.reset()
     return {"status": "detached"}
 
 
 @mcp.tool()
 def terminate() -> dict:
     """
-    Terminate the debugged process and end the session.
+    Terminate the debugged process and end the session (user-mode only).
+
+    For kernel and crash-dump sessions this just ends the session.
 
     Returns: {status}
     """
     if STATE.dbg is None:
         return {"status": "no_session"}
-    STATE.dbg.terminate()
-    STATE.dbg = None
+    try:
+        if STATE.dbg_type == "user" and hasattr(STATE.dbg, "terminate"):
+            STATE.dbg.terminate()
+        else:
+            try:
+                STATE.dbg._client.EndSession(DbgEng.DEBUG_END_ACTIVE_TERMINATE)
+            except Exception:
+                pass
+    finally:
+        STATE.reset()
     return {"status": "terminated"}
 
 
@@ -424,15 +537,21 @@ def go(timeout: int = 30000) -> dict:
     Continue execution until the next debug event (breakpoint, exception, etc.).
 
     Args:
-        timeout: Maximum wait time in milliseconds (default 30000 = 30s)
+        timeout: Maximum wait time in milliseconds (default 30000 = 30s).
+                 Pass 0 or a negative value for infinite wait.
 
     Returns: {status, rip, symbol, new_captures, captures}
     """
     _require_session()
     prev_len = len(STATE.captures)
-    STATE.dbg.go(timeout=timeout)
+    # pybag go() timeout is in seconds (-1 = WAIT_INFINITE);
+    # the MCP parameter is in milliseconds.
+    if timeout <= 0:
+        STATE.dbg.go(timeout=-1)
+    else:
+        STATE.dbg.go(timeout=max(1, timeout // 1000))
     new_captures = STATE.captures[prev_len:]
-    pc = STATE.dbg.pc()
+    pc = STATE.dbg.reg.get_pc()
     return {
         "status": "stopped",
         "rip": hex(pc),
@@ -454,10 +573,11 @@ def step_into(count: int = 1) -> dict:
     """
     _require_session()
     STATE.dbg.stepi(count=count)
-    pc = STATE.dbg.pc()
+    pc = STATE.dbg.reg.get_pc()
+    ins = STATE.dbg.instruction_at(pc)
     return {
         "rip": hex(pc),
-        "instruction": STATE.dbg.instruction_at(pc),
+        "instruction": ins[0] if ins else None,
         "symbol": STATE.dbg.get_name_by_offset(pc),
     }
 
@@ -474,10 +594,11 @@ def step_over(count: int = 1) -> dict:
     """
     _require_session()
     STATE.dbg.stepo(count=count)
-    pc = STATE.dbg.pc()
+    pc = STATE.dbg.reg.get_pc()
+    ins = STATE.dbg.instruction_at(pc)
     return {
         "rip": hex(pc),
-        "instruction": STATE.dbg.instruction_at(pc),
+        "instruction": ins[0] if ins else None,
         "symbol": STATE.dbg.get_name_by_offset(pc),
     }
 
@@ -491,10 +612,11 @@ def step_out() -> dict:
     """
     _require_session()
     STATE.dbg.stepout()
-    pc = STATE.dbg.pc()
+    pc = STATE.dbg.reg.get_pc()
+    ins = STATE.dbg.instruction_at(pc)
     return {
         "rip": hex(pc),
-        "instruction": STATE.dbg.instruction_at(pc),
+        "instruction": ins[0] if ins else None,
         "symbol": STATE.dbg.get_name_by_offset(pc),
     }
 
@@ -513,7 +635,7 @@ def goto(expr: str) -> dict:
     if not expr:
         raise ValueError("expr is required")
     STATE.dbg.goto(expr)
-    pc = STATE.dbg.pc()
+    pc = STATE.dbg.reg.get_pc()
     return {"rip": hex(pc), "symbol": STATE.dbg.get_name_by_offset(pc)}
 
 
@@ -530,10 +652,11 @@ def trace(count: int = 10) -> dict:
     _require_session()
     instructions = []
     for _ in range(count):
-        pc = STATE.dbg.pc()
+        pc = STATE.dbg.reg.get_pc()
+        ins = STATE.dbg.instruction_at(pc)
         instructions.append({
             "rip": hex(pc),
-            "instruction": STATE.dbg.instruction_at(pc),
+            "instruction": ins[0] if ins else None,
             "symbol": STATE.dbg.get_name_by_offset(pc),
         })
         STATE.dbg.stepi(count=1)
@@ -567,9 +690,7 @@ def bp(
     _require_session()
     if not expr:
         raise ValueError("expr is required (symbol name or hex address)")
-    bp_id = STATE.next_bp_id()
-    bp_info = {
-        "id": bp_id,
+    bp_info: dict[str, Any] = {
         "expr": expr,
         "type": "software",
         "capture": capture,
@@ -577,12 +698,20 @@ def bp(
         "oneshot": oneshot,
     }
     handler = STATE.make_handler(bp_info) if capture else None
-    STATE.dbg.bp(expr, handler=handler, oneshot=oneshot, passcount=passcount)
+    bp_id = STATE.dbg.bp(expr, handler=handler, oneshot=oneshot, passcount=passcount)
+    if bp_id is None:
+        # pybag returns None when the breakpoint already existed (it just re-enables it)
+        bp_id = STATE.dbg.breakpoints.find(expr.encode() if isinstance(expr, str) else expr)
+    bp_info["id"] = bp_id
     STATE.bp_map[bp_id] = bp_info
     addr = None
     try:
-        addr = hex(STATE.dbg.symbol(expr))
+        sym_addr = STATE.dbg.symbol(expr)
+        if sym_addr != -1:
+            addr = hex(sym_addr)
     except Exception:
+        pass
+    if addr is None:
         try:
             addr = hex(int(expr, 16))
         except Exception:
@@ -616,9 +745,7 @@ def hw_bp(
     if addr is None:
         raise ValueError("addr is required")
     parsed_addr = _parse_addr(addr)
-    bp_id = STATE.next_bp_id()
-    bp_info = {
-        "id": bp_id,
+    bp_info: dict[str, Any] = {
         "expr": hex(parsed_addr),
         "type": "hardware",
         "size": size,
@@ -628,7 +755,23 @@ def hw_bp(
         "oneshot": oneshot,
     }
     handler = STATE.make_handler(bp_info) if capture else None
-    STATE.dbg.ba(hex(parsed_addr), handler=handler, oneshot=oneshot, size=size, access=access)
+    # Map MCP access codes ('e'/'w'/'r') to dbgeng access constants.
+    access_map = {
+        "e": DbgEng.DEBUG_BREAK_EXECUTE,
+        "w": DbgEng.DEBUG_BREAK_WRITE,
+        "r": DbgEng.DEBUG_BREAK_READ,
+    }
+    pybag_access = access_map.get(access, access)
+    bp_id = STATE.dbg.ba(
+        hex(parsed_addr),
+        handler=handler,
+        oneshot=oneshot,
+        size=size,
+        access=pybag_access,
+    )
+    if bp_id is None:
+        bp_id = STATE.dbg.breakpoints.find(hex(parsed_addr).encode())
+    bp_info["id"] = bp_id
     STATE.bp_map[bp_id] = bp_info
     return {"id": bp_id, "addr": hex(parsed_addr), "size": size, "access": access}
 
@@ -749,27 +892,26 @@ def capture_state() -> dict:
     snap: dict[str, Any] = {"timestamp": datetime.now().isoformat()}
 
     try:
-        reg_dict = {}
-        for name in STATE.dbg.regs:
-            try:
-                reg_dict[name] = hex(STATE.dbg.regs[name])
-            except Exception:
-                pass
-        snap["registers"] = reg_dict
+        snap["registers"] = _gather_registers(STATE.dbg.reg)
     except Exception as e:
         snap["registers"] = {"error": str(e)}
 
     try:
-        pc = STATE.dbg.pc()
+        pc = STATE.dbg.reg.get_pc()
         snap["rip"] = hex(pc)
         snap["symbol_at_rip"] = STATE.dbg.get_name_by_offset(pc)
-        snap["instruction"] = STATE.dbg.instruction_at(pc)
-        snap["disasm_5"] = str(STATE.dbg.disasm(pc, count=5))
+        ins = STATE.dbg.instruction_at(pc)
+        snap["instruction"] = ins[0] if ins else None
+        disasm_lines = [
+            _pybag_util.str_instruction(ins_obj, STATE.dbg.bitness())
+            for _, ins_obj in itertools.islice(STATE.dbg._disasm(pc), 5)
+        ]
+        snap["disasm_5"] = "\n".join(disasm_lines)
     except Exception as e:
         snap["rip_error"] = str(e)
 
     try:
-        sp = STATE.dbg.regs.get_sp()
+        sp = STATE.dbg.reg.get_sp()
         data = STATE.dbg.read(sp, 64)
         snap["stack_at_rsp"] = {"addr": hex(sp), **_fmt_bytes(data)}
     except Exception as e:
@@ -885,17 +1027,20 @@ def read_str(addr: str, wide: bool = False) -> dict:
 @mcp.tool()
 def dump_mem(addr: str, count: int = 8) -> dict:
     """
-    Formatted dword/pointer dump, similar to the 'dd'/'dp' commands in WinDbg.
+    Formatted dword dump, similar to the 'dd' command in WinDbg.
 
     Args:
         addr: Starting hex address
-        count: Number of dwords/pointers to display (default 8)
+        count: Number of dwords to display (default 8)
 
     Returns: {addr, output}
     """
     _require_session()
     parsed = _parse_addr(addr)
-    output = STATE.dbg.dd(parsed, count=count)
+    # Use raw 'dd' so the dbgeng output callbacks produce a properly-formatted
+    # 64-bit address dump. pybag's own dd() prints via Python print() with a
+    # truncated 7-digit address format, which makes kernel addresses unreadable.
+    output = STATE.dbg.cmd(f"dd 0x{parsed:x} L{count}")
     return {"addr": hex(parsed), "output": str(output)}
 
 
@@ -912,8 +1057,8 @@ def mem_info(addr: str) -> dict:
     """
     _require_session()
     parsed = _parse_addr(addr)
-    info = STATE.dbg.address(parsed)
-    return {"addr": hex(parsed), "info": str(info)}
+    info = STATE.dbg._dataspaces.QueryVirtual(parsed)
+    return {"addr": hex(parsed), "info": _pybag_util.str_memory_info(info)}
 
 
 @mcp.tool()
@@ -921,10 +1066,17 @@ def mem_list() -> list:
     """
     List all virtual memory regions in the target process address space.
 
+    Not available in kernel-mode debugging — use raw('!address') instead.
+
     Returns: [region_description_strings]
     """
     _require_session()
-    return [str(r) for r in STATE.dbg.memory_list()]
+    if STATE.dbg_type == "kernel":
+        raise RuntimeError(
+            "mem_list is not supported in kernel mode (would walk the entire "
+            "kernel virtual address space). Use raw('!address') or raw('!vm') instead."
+        )
+    return [_pybag_util.str_memory_info(r) for r in STATE.dbg.memory_list()]
 
 
 # ===========================================================================
@@ -939,13 +1091,7 @@ def get_regs() -> dict:
     Returns: {rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, rip, r8-r15, eflags, ...}
     """
     _require_session()
-    result = {}
-    for name in STATE.dbg.regs:
-        try:
-            result[name] = hex(STATE.dbg.regs[name])
-        except Exception:
-            pass
-    return result
+    return _gather_registers(STATE.dbg.reg)
 
 
 @mcp.tool()
@@ -961,7 +1107,7 @@ def get_reg(name: str) -> dict:
     _require_session()
     if not name:
         raise ValueError("name is required, e.g. 'rax'")
-    return {"name": name, "value": hex(STATE.dbg.regs[name])}
+    return {"name": name, "value": hex(STATE.dbg.reg[name])}
 
 
 @mcp.tool()
@@ -979,7 +1125,7 @@ def set_reg(name: str, value: str) -> dict:
     if not name or value is None:
         raise ValueError("name and value are required")
     int_value = int(value, 16) if str(value).startswith("0x") else int(value)
-    STATE.dbg.regs[name] = int_value
+    STATE.dbg.reg[name] = int_value
     return {"status": "set", "name": name, "value": hex(int_value)}
 
 
@@ -992,11 +1138,12 @@ def get_pc() -> dict:
     Returns: {value, symbol, instruction}
     """
     _require_session()
-    pc = STATE.dbg.pc()
+    pc = STATE.dbg.reg.get_pc()
+    ins = STATE.dbg.instruction_at(pc)
     return {
         "value": hex(pc),
         "symbol": STATE.dbg.get_name_by_offset(pc),
-        "instruction": STATE.dbg.instruction_at(pc),
+        "instruction": ins[0] if ins else None,
     }
 
 
@@ -1008,7 +1155,7 @@ def get_sp() -> dict:
     Returns: {value}
     """
     _require_session()
-    return {"value": hex(STATE.dbg.regs.get_sp())}
+    return {"value": hex(STATE.dbg.reg.get_sp())}
 
 
 # ===========================================================================
@@ -1044,13 +1191,20 @@ def find_symbols(pattern: str) -> list:
     Args:
         pattern: Wildcard pattern (e.g. "ntdll!*Alloc*", "kernel32!*File*")
 
-    Returns: [symbol_string, ...]
+    Returns: [{addr, name}, ...]
     """
     _require_session()
     if not pattern:
         raise ValueError("pattern is required, e.g. 'ntdll!*Alloc*'")
     results = STATE.dbg.find_symbol(pattern)
-    return [str(r) for r in results]
+    out = []
+    for r in results:
+        try:
+            offset, name = r
+            out.append({"addr": hex(offset), "name": _decode(name)})
+        except Exception:
+            out.append({"raw": str(r)})
+    return out
 
 
 @mcp.tool()
@@ -1081,9 +1235,12 @@ def disasm(addr: str = None, count: int = 10) -> dict:
     Returns: {addr, output}
     """
     _require_session()
-    parsed = _parse_addr(addr) if addr else STATE.dbg.pc()
-    output = STATE.dbg.disasm(parsed, count=count)
-    return {"addr": hex(parsed), "output": str(output)}
+    parsed = _parse_addr(addr) if addr else STATE.dbg.reg.get_pc()
+    lines = [
+        _pybag_util.str_instruction(ins_obj, STATE.dbg.bitness())
+        for _, ins_obj in itertools.islice(STATE.dbg._disasm(parsed), count)
+    ]
+    return {"addr": hex(parsed), "output": "\n".join(lines)}
 
 
 @mcp.tool()
@@ -1098,9 +1255,8 @@ def whereami(addr: str = None) -> dict:
     Returns: {description}
     """
     _require_session()
-    parsed = _parse_addr(addr) if addr else None
-    result = STATE.dbg.whereami(parsed)
-    return {"description": str(result)}
+    parsed = _parse_addr(addr) if addr else STATE.dbg.reg.get_pc()
+    return {"description": STATE.dbg.get_name_by_offset(parsed)}
 
 
 # ===========================================================================
@@ -1116,7 +1272,13 @@ def list_modules() -> list:
     """
     _require_session()
     modules = []
-    for name, mp in STATE.dbg.module_list():
+    for names, mp in STATE.dbg.module_list():
+        # names is a tuple (imageName, moduleName, loadedImageName)
+        try:
+            name = names[1] if isinstance(names, tuple) else names
+            name = name.decode() if isinstance(name, bytes) else name
+        except Exception:
+            name = str(names)
         entry: dict[str, Any] = {"name": name}
         try:
             entry["base"] = hex(mp.Base)
@@ -1140,7 +1302,7 @@ def module_info(name: str) -> dict:
     _require_session()
     if not name:
         raise ValueError("name is required, e.g. 'kernel32.dll'")
-    mod = STATE.dbg.modules[name]
+    mod = STATE.dbg.mod[name]
     result: dict[str, Any] = {"name": name}
     try:
         result["entry_point"] = hex(mod.entry_point())
@@ -1166,7 +1328,17 @@ def get_exports(name: str) -> list:
     _require_session()
     if not name:
         raise ValueError("name is required")
-    return [str(e) for e in STATE.dbg.exports(name)]
+    mod = STATE.dbg.mod[name]
+    results = []
+    for e in mod.export_list():
+        if e.forwarder:
+            entry = "%s -> %s" % (e.name.decode(), e.forwarder.decode())
+        else:
+            entry_name = (e.name.decode() if e.name else
+                          ("ORD(%d)" % e.ordinal) if e.ordinal else "[UNKNOWN]")
+            entry = "%015x  %s" % (e.address, entry_name)
+        results.append(entry)
+    return results
 
 
 @mcp.tool()
@@ -1182,7 +1354,16 @@ def get_imports(name: str) -> list:
     _require_session()
     if not name:
         raise ValueError("name is required")
-    return [str(i) for i in STATE.dbg.imports(name)]
+    mod = STATE.dbg.mod[name]
+    results = []
+    for imp_dir in mod.import_list():
+        for fn in imp_dir.imports:
+            if fn.import_by_ordinal:
+                entry = "%s!ORD(%d)" % (imp_dir.dll.decode(), fn.ordinal)
+            else:
+                entry = "%s!%s" % (imp_dir.dll.decode(), fn.name.decode())
+            results.append("%015x  %s" % (fn.address, entry))
+    return results
 
 
 # ===========================================================================
@@ -1192,12 +1373,26 @@ def get_imports(name: str) -> list:
 @mcp.tool()
 def list_threads() -> list:
     """
-    List all threads in the target process.
+    List all threads in the target.
 
-    Returns: [thread_description_string, ...]
+    In kernel mode this lists processor threads; use raw('!process 0 0') to
+    list user-mode threads in the active process.
+
+    Returns: [{sysid, teb, symbol_at_pc}, ...]
     """
     _require_session()
-    return [str(t) for t in STATE.dbg.thread_list()]
+    out = []
+    for t in STATE.dbg.thread_list():
+        try:
+            sysid, teb, sym = t
+            out.append({
+                "sysid": int(sysid) if sysid is not None else None,
+                "teb": hex(teb) if isinstance(teb, int) else str(teb),
+                "symbol_at_pc": _decode(sym),
+            })
+        except Exception:
+            out.append({"raw": str(t)})
+    return out
 
 
 @mcp.tool()
@@ -1282,12 +1477,30 @@ def get_peb() -> dict:
 @mcp.tool()
 def get_handles() -> list:
     """
-    Get all open handles in the target process.
+    Get all open handles in the target process (user-mode only).
 
-    Returns: [handle_description_string, ...]
+    Not available in kernel mode — use raw('!handle 0 f') instead.
+
+    Returns: [{handle, type, name}, ...]
     """
     _require_session()
-    return [str(h) for h in STATE.dbg.handle_list()]
+    if STATE.dbg_type == "kernel":
+        raise RuntimeError(
+            "get_handles is not supported in kernel mode. "
+            "Use raw('!handle 0 f') for the active process or raw('!process 0 f') for all."
+        )
+    out = []
+    for h in STATE.dbg.handle_list():
+        try:
+            handle_val, htype, hname = h
+            out.append({
+                "handle": hex(handle_val) if isinstance(handle_val, int) else str(handle_val),
+                "type": _decode(htype),
+                "name": _decode(hname),
+            })
+        except Exception:
+            out.append({"raw": str(h)})
+    return out
 
 
 @mcp.tool()
